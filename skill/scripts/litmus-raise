@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""litmus-raise: replace each `raise` in one file with `pass`, one at a time, and rerun the tests.
+
+    litmus-raise <file.py> <test command...>
+    litmus-raise src/pkg/mod.py uv run --locked pytest -x -q -p no:randomly
+
+A `raise` whose removal leaves the test command green guards an error path no test
+checks. Exits 1 and lists those lines when any survive, 2 when the command fails
+before any change. The file is rewritten in place and restored when the run ends or
+is interrupted; run it on a copy or a clean worktree.
+"""
+
+import ast
+import os
+import pathlib
+import subprocess
+import sys
+
+
+def passes(cmd: list[str], path: pathlib.Path) -> bool:
+    # A mutant of the same size written within the same second would load the previous
+    # run's cached bytecode, so drop the cache and write none.
+    for pyc in (path.parent / "__pycache__").glob(f"{path.stem}.*.pyc"):
+        pyc.unlink()
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, check=False).returncode == 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    path, cmd = pathlib.Path(argv[0]), argv[1:]
+    orig = path.read_bytes()
+    # ast offsets are UTF-8 byte offsets, so edit bytes.
+    lines = orig.splitlines(keepends=True)
+    raises = sorted((n for n in ast.walk(ast.parse(orig)) if isinstance(n, ast.Raise)), key=lambda n: n.lineno)
+    if not passes(cmd, path):
+        print("the test command fails on the unchanged file; fix that first", file=sys.stderr)
+        return 2
+    survivors = []
+    try:
+        for node in raises:
+            first, last = node.lineno - 1, (node.end_lineno or node.lineno) - 1
+            mutated = lines[:]
+            mutated[first : last + 1] = [
+                lines[first][: node.col_offset] + b"pass" + lines[last][node.end_col_offset :]
+            ]
+            path.write_bytes(b"".join(mutated))
+            if passes(cmd, path):
+                survivors.append(node.lineno)
+    finally:
+        path.write_bytes(orig)
+    print(f"{path}: {len(raises)} raise statements, {len(survivors)} survived removal: lines {survivors}")
+    return 1 if survivors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

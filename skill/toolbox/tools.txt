@@ -1,6 +1,6 @@
 # Tools the checklist and CI shape rely on, pinned. Tools the skill names for some
-# projects only (cosmic-ray, simloop, pytest-codspeed, pyperf, deal, icontract) are not
-# listed; pin one in the project when you adopt it.
+# projects only (for example pytest-codspeed, deal, time-machine, py-spy) are not listed; pin one in the project when
+# you adopt it.
 #
 # kind "tool": a standalone CLI. The toolbox installs it with `uv tool install`, and
 #   `impeccable setup host` installs the same version on the host.
@@ -24,7 +24,6 @@ pypi-attestations       0.0.30    tool
 pytest                  9.1.1     dev
 pytest-randomly         5.0.0     dev
 pytest-repeat           0.9.4     dev
-pytest-rerunfailures    16.7      dev
 pytest-timeout          2.4.0     dev
 coverage                7.16.2    dev
 diff-cover              10.6.0    dev

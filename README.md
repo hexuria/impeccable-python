@@ -2,8 +2,7 @@
 
 An agent skill for writing, reviewing, and verifying high-stakes Python. It
 works with Claude Code, Codex, Cursor, and any agent that loads `SKILL.md`
-skills. It is the sibling of
-[impeccable-rust](https://github.com/hexuria/impeccable-rust).
+skills.
 
 The skill makes an agent treat "the tests pass" as the start of the job. The
 agent checks the change against the failures that can actually happen, picks
@@ -20,16 +19,15 @@ bounds, and what was left out.
   coverage.py, diff-cover, mutmut, Hypothesis, CrossHair, Atheris, typeguard,
   frontrun, pytest-run-parallel, free-threaded CPython, ASan, UBSan,
   Valgrind, CodSpeed, pytest-benchmark, pytest-memray, Griffe, uv,
-  pip-audit, osv-scanner, PEP 740 attestations, zizmor, TLA+, Nagini, Dafny,
-  and Lean.
+  pip-audit, osv-scanner, PEP 740 attestations, zizmor, TLA+, Nagini, and
+  Lean.
 - **Risk-to-owner routing.** Each failure class gets one owner: the type
   checker for type misuse, Atheris for untrusted input, sanitizers for C
-  extensions, impeccable-rust for Rust extensions, frontrun for small thread
-  protocols, TLA+ for multi-actor designs, CrossHair for bounded symbolic
-  checks, Nagini, Dafny, or Lean for proof kernels, and pip-audit and zizmor
-  for supply chain and CI.
-- **Honest about gaps.** Python has no Loom and no Miri. The skill says what
-  owns those failure classes instead, and what stays uncovered.
+  extensions, frontrun for small thread protocols, TLA+ for multi-actor
+  designs, CrossHair for bounded symbolic checks, Nagini or Lean for proof
+  kernels, and pip-audit and zizmor for supply chain and CI.
+- **Honest about gaps.** For thread interleavings and native memory, the skill
+  names the check that owns each failure and says what stays uncovered.
 - **Differential oracle for rewrites.** A rewrite, port, or optimization keeps
   the old implementation until the new one matches it on generated inputs.
 - **Anti-drift rules.** One harness per property, and no second model of the
@@ -62,6 +60,9 @@ Strict loaders reject a folder named `skill`. For other agents, put the same
 folder wherever they load skills from, for example `.claude/skills/` or
 `.cursor/skills/` inside a project.
 
+Rust extensions (PyO3, maturin): the skill hands their Rust side to the
+impeccable-rust skill; install it too if you ship one.
+
 ## Toolbox
 
 The skill ships `scripts/impeccable`, which sets up and runs the command-line
@@ -77,7 +78,7 @@ impeccable run uv run --locked pytest              # any command, in Linux, on t
 UV_PYTHON=3.14t impeccable run uv run --locked pytest   # the same on free-threaded CPython
 impeccable sanitize address          # pytest with C extensions rebuilt under ASan
 impeccable valgrind                  # pytest under Valgrind memcheck
-impeccable fuzz fuzz/parse.py        # an Atheris harness, 60 seconds by default
+impeccable fuzz tests/fuzz_parse.py  # an Atheris harness, 60 seconds by default
 impeccable setup host                # or install the same pinned tools on this machine
 ```
 
@@ -93,13 +94,13 @@ untouched. Editing a pin rebuilds the image on the next run and removes the
 superseded one.
 
 Libraries that import your code (pytest and its plugins, Hypothesis,
-CrossHair, mutmut, mypy or Pyright) belong in your project's dev dependencies
+CrossHair, mutmut, mypy, Pyright) belong in your project's dev dependencies
 and `uv.lock`. `impeccable doctor` lists the versions the skill was written
 against and shows which ones your environment lacks. The provers (Nagini,
-Dafny, Lean) are not included.
+Lean) are not included.
 
-On macOS the toolbox runs what the host cannot: Valgrind, LeakSanitizer,
-Atheris (its wheels are Linux x86_64 only), and the sanitizer builds.
+On macOS the toolbox runs what the host cannot: Valgrind, Atheris (its wheels
+are Linux x86_64 only), and the sanitizer builds.
 
 ## Use it
 

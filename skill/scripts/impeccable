@@ -19,7 +19,7 @@
 # Environment:
 #   IMPECCABLE_MOUNT=<dir>              mount this directory instead of the detected project root
 #   IMPECCABLE_FUZZ_SECONDS=<n>         fuzz time limit when no -max_total_time or -runs is given (60)
-#   IMPECCABLE_SANITIZE_PACKAGES="a b"  packages sanitize rebuilds (default: the project in pyproject.toml)
+#   IMPECCABLE_SANITIZE_PACKAGES="a b"  packages sanitize rebuilds from source (default: the project)
 #   UV_PYTHON=<version>                 interpreter for the project environment, for example 3.14t
 set -euo pipefail
 
@@ -374,8 +374,8 @@ project_name() {
 }
 
 cmd_sanitize() {
-  local kind=${1:-} part flags env pkg tmp
-  local -a reinstall=() preload=()
+  local kind=${1:-} part flags env pkg tmp cache so symbols found
+  local -a pkgs=() reinstall=() preload=()
   [ -n "$kind" ] || die "usage: impeccable sanitize <address|undefined|address,undefined> [pytest args]"
   shift
   for part in ${kind//,/ }; do
@@ -391,7 +391,7 @@ cmd_sanitize() {
 
   # Instrument the extensions, not the interpreter: an unmodified CPython works with the
   # ASan runtime preloaded. Build into a separate environment so .venv stays uninstrumented,
-  # and install non-editable so no instrumented build lands in the source tree.
+  # and install non-editable; the instrumented build tree is removed after the sync.
   flags="-fsanitize=$kind -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
   export CC=gcc CXX=g++ LDSHARED="gcc -shared" LDCXXSHARED="g++ -shared"
   export CFLAGS="${CFLAGS:+$CFLAGS }$flags"
@@ -400,15 +400,53 @@ cmd_sanitize() {
   env=$(project_env)
   export UV_PROJECT_ENVIRONMENT="$env-sanitize-${kind//,/-}"
 
-  for pkg in ${IMPECCABLE_SANITIZE_PACKAGES:-$(project_name)}; do reinstall+=(--reinstall-package "$pkg"); done
-  [ ${#reinstall[@]} -gt 0 ] || die "cannot read the project name; set IMPECCABLE_SANITIZE_PACKAGES"
+  # --reinstall-package alone puts a cached PyPI wheel back; --no-binary-package builds from
+  # source. uv caches source builds whatever the flags, so each sanitizer gets its own cache:
+  # no instrumented wheel reaches the shared cache, and no other kind's build is reused.
+  cache=$(uv cache dir)
+  export UV_CACHE_DIR="$cache-sanitize-${kind//,/-}"
+  for pkg in ${IMPECCABLE_SANITIZE_PACKAGES:-$(project_name)}; do
+    pkgs+=("$pkg")
+    reinstall+=(--reinstall-package "$pkg" --no-binary-package "$pkg")
+  done
+  [ ${#pkgs[@]} -gt 0 ] || die "cannot read the project name; set IMPECCABLE_SANITIZE_PACKAGES"
   # setuptools reuses object files left in build/ by an earlier run with other flags, so
-  # build outside the tree and force the rebuild. Other backends build in a fresh directory.
+  # force the rebuild, in a directory normal builds never use. The relative build_base
+  # resolves inside each package's source tree, so packages built at once never share one.
+  # Other backends build in a fresh directory.
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/impeccable-sanitize.XXXXXX")
-  printf '[build]\nbuild_base = %s/build\n\n[build_ext]\nforce = 1\n' "$tmp" >"$tmp/setup.cfg"
-  say "rebuilding ${reinstall[*]} with $flags into $UV_PROJECT_ENVIRONMENT"
+  printf '[build]\nbuild_base = build/impeccable-sanitize-%s\n\n[build_ext]\nforce = 1\n' "${kind//,/-}" >"$tmp/setup.cfg"
+  say "rebuilding ${pkgs[*]} from source with $flags into $UV_PROJECT_ENVIRONMENT"
   DIST_EXTRA_CONFIG=$tmp/setup.cfg uv sync --locked --no-editable "${reinstall[@]}"
   rm -r -- "$tmp"
+  # Only the directory named in setup.cfg above; nothing else under build/.
+  build_dir="$(project_root)/build/impeccable-sanitize-${kind//,/-}"
+  if [ -d "$build_dir" ]; then rm -r -- "$build_dir"; fi
+  rmdir "$(project_root)/build" 2>/dev/null || true
+
+  # An uninstrumented run reports clean, so fail unless each rebuilt package ships an
+  # extension that links the sanitizer runtime.
+  symbols="__(${kind//,/|})_"
+  symbols=${symbols//address/asan}
+  symbols=${symbols//undefined/ubsan}
+  for pkg in "${pkgs[@]}"; do
+    found=""
+    while IFS= read -r so; do
+      # Not a pipe: grep -q exits at the first match, nm dies of SIGPIPE, and pipefail
+      # turns an instrumented extension into a miss.
+      syms=$(nm -D "$so" 2>/dev/null || true)
+      if grep -q -E "$symbols" <<<"$syms"; then found=$so; break; fi
+    done < <(uv run --no-sync python - "$pkg" <<'EOF'
+import sys
+from importlib import metadata
+for f in metadata.files(sys.argv[1]) or ():
+    if f.name.endswith(".so"):
+        print(f.locate())
+EOF
+    )
+    [ -n "$found" ] || die "$pkg has no extension built with -fsanitize=$kind; nothing native would be checked"
+    say "instrumented: $found"
+  done
 
   # CPython leaks at exit by design, so leak detection stays off unless ASAN_OPTIONS says
   # otherwise. pymalloc hides overflows inside its own blocks, so use libc malloc, which
