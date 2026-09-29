@@ -14,6 +14,9 @@ ARG TLA_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 ARG OSV_SCANNER_VERSION=2.6.0
 ARG OSV_SCANNER_SHA256_AMD64=ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
 ARG OSV_SCANNER_SHA256_ARM64=2c71403eb443d05891c4f268c3ad771cf4f16e5443463fd7851ef8f454d3c7e4
+ARG ACTIONLINT_VERSION=1.7.12
+ARG ACTIONLINT_SHA256_AMD64=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+ARG ACTIONLINT_SHA256_ARM64=325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6
 # Atheris 3.1.0 has no git tag, no sdist, and PyPI wheels only for x86_64, so it is built
 # here from the commit PyPI 3.1.0 was released from, for each interpreter it supports.
 ARG ATHERIS_VERSION=3.1.0
@@ -52,6 +55,14 @@ RUN arch="$(dpkg --print-architecture)" \
       "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_${arch}" \
  && echo "${sum}  /usr/local/bin/osv-scanner" | sha256sum -c - \
  && chmod +x /usr/local/bin/osv-scanner
+
+RUN arch="$(dpkg --print-architecture)" \
+ && case "${arch}" in amd64) sum="${ACTIONLINT_SHA256_AMD64}" ;; arm64) sum="${ACTIONLINT_SHA256_ARM64}" ;; *) exit 1 ;; esac \
+ && tgz="actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz" \
+ && curl -fsSL -o "/tmp/${tgz}" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tgz}" \
+ && echo "${sum}  /tmp/${tgz}" | sha256sum -c - \
+ && tar -xzf "/tmp/${tgz}" -C /usr/local/bin actionlint \
+ && rm "/tmp/${tgz}"
 
 # `impeccable fuzz` installs the matching wheel into the project environment from here.
 RUN git clone --quiet --filter=blob:none https://github.com/google/atheris /tmp/atheris \

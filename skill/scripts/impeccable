@@ -41,7 +41,7 @@ IMAGE_REPO=impeccable-python-toolbox
 SANITIZERS="address undefined"
 PASS_ENV="CI UV_PYTHON UV_LOCKED UV_EXCLUDE_NEWER HYPOTHESIS_PROFILE PYTEST_ADDOPTS
   PYTHONDEVMODE PYTHONWARNINGS PYTHONMALLOC PYTHONHASHSEED PYTHONFAULTHANDLER
-  PYTHONASYNCIODEBUG PYTHONTRACEMALLOC PYTHON_GIL COVERAGE_CORE
+  PYTHONASYNCIODEBUG PYTHONTRACEMALLOC PYTHONWARNDEFAULTENCODING PYTHON_GIL COVERAGE_CORE
   IMPECCABLE_FUZZ_SECONDS IMPECCABLE_SANITIZE_PACKAGES
   ASAN_OPTIONS UBSAN_OPTIONS TSAN_OPTIONS LSAN_OPTIONS"
 
@@ -50,6 +50,15 @@ die() { say "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 in_toolbox() { [ -n "${IMPECCABLE_IN_TOOLBOX:-}" ]; }
 hash12() { { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-12; }
+# verify_sha256 FILE SUMS: FILE's hash must equal its entry in SUMS. One hasher is chosen up front;
+# a "shasum -c || sha256sum -c" fallback passes on macOS, where BSD sha256sum accepts empty input.
+verify_sha256() {
+  local want got
+  want=$(awk -v f="$1" '$2 == f || $2 == "*" f { print $1; exit }' "$2")
+  if have sha256sum; then got=$(sha256sum "$1"); else got=$(shasum -a 256 "$1"); fi
+  got=${got%% *}
+  [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch for $1 (want ${want:-no entry in $2}, got $got)"
+}
 first_version() { grep -E -o '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1; }
 
 usage() {
@@ -193,6 +202,10 @@ cmd_doctor() {
   if have osv-scanner; then v=$(osv-scanner --version 2>/dev/null | first_version || true); fi
   row osv-scanner "$(version_cell "$v" "$(pin OSV_SCANNER_VERSION)")" "$(pin OSV_SCANNER_VERSION)"
 
+  v=""
+  if have actionlint; then v=$(actionlint --version 2>/dev/null | first_version || true); fi
+  row actionlint "$(version_cell "$v" "$(pin ACTIONLINT_VERSION)")" "$(pin ACTIONLINT_VERSION)"
+
   if in_toolbox; then host="built from source"
   elif atheris_wheel_exists; then host="PyPI wheel via impeccable fuzz"
   else host="no wheel for $(uname -s) $(uname -m)"; fi
@@ -285,7 +298,7 @@ setup_toolbox() {
 }
 
 setup_host() {
-  local dry="" name ver kind _cmd v os arch osv bin tmp
+  local dry="" name ver kind _cmd v os arch osv al bin tmp
   while [ $# -gt 0 ]; do
     case $1 in
       --dry-run) dry=1 ;;
@@ -324,11 +337,32 @@ setup_host() {
       base="https://github.com/google/osv-scanner/releases/download/v$osv"
       curl -fsSLO "$base/osv-scanner_${os}_${arch}"
       curl -fsSLO "$base/osv-scanner_SHA256SUMS"
-      grep " osv-scanner_${os}_${arch}\$" osv-scanner_SHA256SUMS | { shasum -a 256 -c - 2>/dev/null || sha256sum -c -; }
+      verify_sha256 "osv-scanner_${os}_${arch}" osv-scanner_SHA256SUMS
       mkdir -p "$bin"
       install -m 0755 "osv-scanner_${os}_${arch}" "$bin/osv-scanner"
     )
     rm -f "$tmp/osv-scanner_${os}_${arch}" "$tmp/osv-scanner_SHA256SUMS"
+    rmdir "$tmp"
+  fi
+
+  # actionlint is a Go binary too, released as a tarball with a checksums file.
+  al=$(pin ACTIONLINT_VERSION)
+  if [ -n "$dry" ]; then
+    printf '  download actionlint_%s_%s_%s.tar.gz, verify its checksum, install to %s\n' "$al" "$os" "$arch" "$bin"
+  else
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/impeccable-actionlint.XXXXXX")
+    (
+      cd "$tmp"
+      tgz="actionlint_${al}_${os}_${arch}.tar.gz"
+      base="https://github.com/rhysd/actionlint/releases/download/v$al"
+      curl -fsSLO "$base/$tgz"
+      curl -fsSLO "$base/actionlint_${al}_checksums.txt"
+      verify_sha256 "$tgz" "actionlint_${al}_checksums.txt"
+      tar -xzf "$tgz" actionlint
+      mkdir -p "$bin"
+      install -m 0755 actionlint "$bin/actionlint"
+      rm -f "$tgz" "actionlint_${al}_checksums.txt" actionlint
+    )
     rmdir "$tmp"
   fi
 

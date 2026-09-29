@@ -12,10 +12,11 @@
 # Pins track the latest release when written; a project with a cooldown
 # (`exclude-newer`) takes the newest version older than its window instead.
 #
-# Interpreters, uv, TLC, osv-scanner, and Atheris are pinned in the Dockerfile.
+# Interpreters, uv, TLC, osv-scanner, actionlint, and Atheris are pinned in the Dockerfile.
 #
 # name                  version   kind  command
 ruff                    0.16.9    tool
+ast-grep-cli            0.45.3    tool  ast-grep
 zizmor                  1.30.1    tool
 pip-audit               2.10.1    tool
 griffe                  2.3.0     tool
@@ -33,6 +34,8 @@ crosshair-tool          0.0.111   dev
 mutmut                  3.8.0     dev
 mypy                    2.3.1     dev
 pyright                 1.1.414   dev
+pyrefly                 1.3.2     dev
+ty                      0.0.84    dev
 typeguard               4.6.0     dev
 pytest-run-parallel     0.10.0    dev
 frontrun                0.7.0     dev

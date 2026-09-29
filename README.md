@@ -12,20 +12,24 @@ bounds, and what was left out.
 ## What it does
 
 - **Checklist for every change.** Strict typing, error-path tests, property
-  and fuzz tests, mutation testing, sanitizers on C and C++ extensions,
-  thread and asyncio checks, trustworthy benchmarks, misuse-resistant APIs,
-  API compatibility, and locked, audited dependencies.
-- **Tools it knows.** Ruff, mypy, Pyright, pytest with strict settings,
-  coverage.py, diff-cover, mutmut, Hypothesis, CrossHair, Atheris, typeguard,
-  frontrun, pytest-run-parallel, free-threaded CPython, ASan, UBSan,
-  Valgrind, CodSpeed, pytest-benchmark, pytest-memray, Griffe, uv,
-  pip-audit, osv-scanner, PEP 740 attestations, zizmor, TLA+, Nagini, and
-  Lean.
+  and fuzz tests, known-answer test vectors, mutation testing, sanitizers on
+  C and C++ extensions, thread and asyncio checks, trustworthy benchmarks,
+  misuse-resistant APIs, API compatibility, public-API typing tests, tests
+  on the built wheel and sdist, downstream tests, and locked, audited
+  dependencies with a cooldown.
+- **Tools it knows.** Ruff, ast-grep, mypy, Pyright, Pyrefly, ty, stubtest,
+  pytest with strict settings, coverage.py, diff-cover, mutmut, Hypothesis,
+  CrossHair, Atheris, OSS-Fuzz and CIFuzz, typeguard, frontrun,
+  pytest-run-parallel, free-threaded CPython, ASan, UBSan, Valgrind,
+  cibuildwheel, maturin-action, CodSpeed, pytest-benchmark, pytest-memray,
+  Griffe, uv, pip-audit, osv-scanner, PEP 740 attestations, Dependabot,
+  zizmor, actionlint, TLA+, Nagini, and Lean.
 - **Risk-to-owner routing.** Each failure class gets one owner: the type
   checker for type misuse, Atheris for untrusted input, sanitizers for C
   extensions, frontrun for small thread protocols, TLA+ for multi-actor
   designs, CrossHair for bounded symbolic checks, Nagini or Lean for proof
-  kernels, and pip-audit and zizmor for supply chain and CI.
+  kernels, typing tests per user checker for public types, and pip-audit,
+  zizmor, and actionlint for supply chain and CI.
 - **Honest about gaps.** For thread interleavings and native memory, the skill
   names the check that owns each failure and says what stays uncovered.
 - **Differential oracle for rewrites.** A rewrite, port, or optimization keeps
@@ -85,16 +89,16 @@ impeccable setup host                # or install the same pinned tools on this 
 The toolbox is a Docker image with its versions pinned in
 [`skill/toolbox/tools.txt`](skill/toolbox/tools.txt) and the
 [`Dockerfile`](skill/toolbox/Dockerfile): uv, CPython 3.12, 3.13, 3.14, and
-free-threaded 3.14t, Ruff, zizmor, pip-audit, Griffe, cyclonedx-py,
-pypi-attestations, osv-scanner, TLC, Valgrind, gcc for sanitizer builds,
-and Atheris built from source with clang. The image is a few GB, and the first
-build takes several minutes. It mounts your project at `/work` and keeps its
+free-threaded 3.14t, Ruff, ast-grep, zizmor, actionlint, pip-audit, Griffe,
+cyclonedx-py, pypi-attestations, osv-scanner, TLC, Valgrind, gcc for
+sanitizer builds, and Atheris built from source with clang. The image is a few
+GB, and the first build takes several minutes. It mounts your project at `/work` and keeps its
 Linux environment and the uv cache in Docker volumes, so your `.venv` stays
 untouched. Editing a pin rebuilds the image on the next run and removes the
 superseded one.
 
 Libraries that import your code (pytest and its plugins, Hypothesis,
-CrossHair, mutmut, mypy, Pyright) belong in your project's dev dependencies
+CrossHair, mutmut, mypy, Pyright, Pyrefly, ty) belong in your project's dev dependencies
 and `uv.lock`. `impeccable doctor` lists the versions the skill was written
 against and shows which ones your environment lacks. The provers (Nagini,
 Lean) are not included.
