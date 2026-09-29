@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# impeccable: set up, check, and run the command-line tools the impeccable-python skill names.
+#
+#   impeccable doctor                    which tools run on this host, in the toolbox, or nowhere
+#   impeccable setup toolbox [--rebuild] build the Linux toolbox image (needs Docker)
+#   impeccable setup host [--dry-run]    install the pinned tools and interpreters on this host with uv
+#   impeccable run [command...]          run a command in the toolbox, on the current project
+#   impeccable sanitize <kind> [pytest args...]
+#                                        pytest with the project's C/C++ extensions rebuilt under a
+#                                        sanitizer: address, undefined, or address,undefined
+#   impeccable valgrind [pytest args...]
+#                                        pytest under Valgrind memcheck, with the uv-managed
+#                                        interpreters' own false positives suppressed
+#   impeccable fuzz <harness.py> [libFuzzer args...]
+#                                        run an Atheris harness in the project environment
+#
+# sanitize, valgrind, and fuzz run on a Linux host that can run them, and in the toolbox otherwise.
+#
+# Environment:
+#   IMPECCABLE_MOUNT=<dir>              mount this directory instead of the detected project root
+#   IMPECCABLE_FUZZ_SECONDS=<n>         fuzz time limit when no -max_total_time or -runs is given (60)
+#   IMPECCABLE_SANITIZE_PACKAGES="a b"  packages sanitize rebuilds (default: the project in pyproject.toml)
+#   UV_PYTHON=<version>                 interpreter for the project environment, for example 3.14t
+set -euo pipefail
+
+resolve_self_dir() {
+  local src=${BASH_SOURCE[0]} dir
+  while [ -L "$src" ]; do
+    dir=$(cd "$(dirname "$src")" && pwd -P)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+  done
+  cd "$(dirname "$src")" && pwd -P
+}
+
+SELF_DIR=$(resolve_self_dir)
+SELF=$SELF_DIR/impeccable
+SKILL_DIR=$(cd "$SELF_DIR/.." && pwd -P)
+TOOLBOX_DIR=$SKILL_DIR/toolbox
+IMAGE_REPO=impeccable-python-toolbox
+SANITIZERS="address undefined"
+PASS_ENV="CI UV_PYTHON UV_LOCKED UV_EXCLUDE_NEWER HYPOTHESIS_PROFILE PYTEST_ADDOPTS
+  PYTHONDEVMODE PYTHONWARNINGS PYTHONMALLOC PYTHONHASHSEED PYTHONFAULTHANDLER
+  PYTHONASYNCIODEBUG PYTHONTRACEMALLOC PYTHON_GIL COVERAGE_CORE
+  IMPECCABLE_FUZZ_SECONDS IMPECCABLE_SANITIZE_PACKAGES
+  ASAN_OPTIONS UBSAN_OPTIONS TSAN_OPTIONS LSAN_OPTIONS"
+
+say() { printf 'impeccable: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+in_toolbox() { [ -n "${IMPECCABLE_IN_TOOLBOX:-}" ]; }
+hash12() { { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-12; }
+first_version() { grep -E -o '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1; }
+
+usage() {
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"
+}
+
+toolbox_file() {
+  local f
+  for f in "$TOOLBOX_DIR/$1" "/usr/local/share/impeccable/$1"; do
+    if [ -f "$f" ]; then echo "$f"; return 0; fi
+  done
+  return 1
+}
+
+# Prints "name version kind [command]" for every pinned tool.
+tools() {
+  local f
+  f=$(toolbox_file tools.txt) || die "tools.txt not found next to $SELF"
+  grep -v -E '^[[:space:]]*(#|$)' "$f"
+}
+
+# A pin from the Dockerfile, for example `pin TLA_VERSION`. Empty inside the toolbox.
+pin() {
+  local f
+  f=$(toolbox_file Dockerfile) || return 0
+  sed -n "s/^ARG $1=//p" "$f" | tr -d '"'
+}
+
+# True when dotted version $1 is older than $2.
+ver_lt() {
+  local IFS=. i x y
+  local -a a b
+  read -r -a a <<<"$1"
+  read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    x=${a[i]:-0}
+    y=${b[i]:-0}
+    if [ "$((10#$x))" -lt "$((10#$y))" ]; then return 0; fi
+    if [ "$((10#$x))" -gt "$((10#$y))" ]; then return 1; fi
+  done
+  return 1
+}
+
+version_cell() { # found pinned
+  if [ -z "$1" ]; then echo missing
+  elif ver_lt "$1" "$2"; then echo "$1, older than pinned"
+  else echo "$1"; fi
+}
+
+# Version of a uv tool (or anything on PATH that prints one with --version).
+UV_TOOLS=""
+host_tool_version() { # name command
+  local v=""
+  if [ -z "$UV_TOOLS" ] && have uv; then UV_TOOLS=$(uv tool list 2>/dev/null || echo none); fi
+  v=$(printf '%s\n' "$UV_TOOLS" | awk -v n="$1" '$1 == n { sub(/^v/, "", $2); print $2; exit }')
+  if [ -z "$v" ] && have "$2"; then v=$("$2" --version 2>/dev/null | first_version || true); fi
+  echo "$v"
+}
+
+# A usable Linux host for native checks: sanitize needs gcc, fuzz needs an Atheris wheel.
+linux_host() { [ "$(uname -s)" = Linux ]; }
+atheris_wheel_exists() { linux_host && [ "$(uname -m)" = x86_64 ]; }
+
+toolbox_image() {
+  [ -f "$TOOLBOX_DIR/Dockerfile" ] || die "toolbox files not found in $TOOLBOX_DIR"
+  printf '%s:%s' "$IMAGE_REPO" \
+    "$(cat "$TOOLBOX_DIR/Dockerfile" "$TOOLBOX_DIR/tools.txt" "$TOOLBOX_DIR/entrypoint" \
+      "$TOOLBOX_DIR/valgrind-python.supp" "$SELF" | hash12)"
+}
+
+docker_ready() { have docker && docker info >/dev/null 2>&1; }
+image_built() { docker image inspect "$1" >/dev/null 2>&1; }
+
+# The directory holding uv.lock (the workspace root), else the git root, else the current directory.
+project_root() {
+  local dir root=""
+  if [ -n "${IMPECCABLE_MOUNT:-}" ]; then
+    (cd "$IMPECCABLE_MOUNT" && pwd -P)
+    return 0
+  fi
+  dir=$(pwd -P)
+  while [ "$dir" != / ]; do
+    if [ -f "$dir/uv.lock" ]; then root=$dir; break; fi
+    dir=$(dirname "$dir")
+  done
+  if [ -z "$root" ]; then root=$(git rev-parse --show-toplevel 2>/dev/null || true); fi
+  if [ -z "$root" ]; then root=$PWD; fi
+  (cd "$root" && pwd -P)
+}
+
+project_env() { echo "${UV_PROJECT_ENVIRONMENT:-$(project_root)/.venv}"; }
+
+cmd_doctor() {
+  local image="" built="" state name ver kind cmd v host tb py want minor found
+  if in_toolbox; then
+    state="inside the toolbox"
+    built=1
+  elif ! have docker; then
+    state="not installed"
+  elif ! docker info >/dev/null 2>&1; then
+    state="installed, not running"
+  else
+    image=$(toolbox_image)
+    if image_built "$image"; then
+      state="ready, $image built"
+      built=1
+    else
+      state="ready, image not built: impeccable setup toolbox"
+    fi
+  fi
+
+  printf 'impeccable doctor on %s %s\n\n' "$(uname -s)" "$(uname -m)"
+  row() { printf '  %-22s %-37s %s\n' "$1" "$2" "$3"; }
+  row TOOL HOST TOOLBOX
+
+  v=""
+  if have uv; then v=$(uv --version 2>/dev/null | first_version || true); fi
+  if [ -z "$v" ]; then host="missing: https://docs.astral.sh/uv/"; else host=$(version_cell "$v" "$(pin UV_VERSION)"); fi
+  row uv "$host" "$(pin UV_VERSION)"
+
+  # One row per minor version; the free-threaded build is its own row (3.14t).
+  for py in $(pin PYTHONS); do
+    want=${py%t}
+    minor=${want%.*}${py#"$want"}
+    found=""
+    if have uv; then found=$(uv python find "$minor" 2>/dev/null || true); fi
+    v=""
+    if [ -n "$found" ]; then
+      v=$("$found" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || true)
+    fi
+    row "python $minor" "$(version_cell "$v" "$want")" "$py"
+  done
+
+  while read -r name ver kind cmd; do
+    [ "$kind" = tool ] || continue
+    v=$(host_tool_version "$name" "${cmd:-$name}")
+    row "$name" "$(version_cell "$v" "$ver")" "$ver"
+  done < <(tools)
+
+  v=""
+  if have osv-scanner; then v=$(osv-scanner --version 2>/dev/null | first_version || true); fi
+  row osv-scanner "$(version_cell "$v" "$(pin OSV_SCANNER_VERSION)")" "$(pin OSV_SCANNER_VERSION)"
+
+  if in_toolbox; then host="built from source"
+  elif atheris_wheel_exists; then host="PyPI wheel via impeccable fuzz"
+  else host="no wheel for $(uname -s) $(uname -m)"; fi
+  row atheris "$host" "$(pin ATHERIS_VERSION)"
+
+  if have valgrind; then host=$(valgrind --version 2>/dev/null | first_version || true)
+  elif [ "$(uname -s)" = Darwin ]; then host="unsupported on macOS"
+  else host=missing; fi
+  row valgrind "$host" yes
+
+  if have tlc; then host=installed
+  elif have java && java -version >/dev/null 2>&1; then host="java only: add a tlc wrapper"
+  else host=missing; fi
+  row "tlc (TLA+)" "$host" "$(pin TLA_VERSION)"
+
+  for kind in $SANITIZERS; do
+    if linux_host && have gcc; then host=supported
+    elif linux_host; then host="needs gcc"
+    else host="runs in the toolbox"; fi
+    row "sanitize $kind" "$host" supported
+  done
+
+  local env pyexe names
+  env=$(project_env)
+  pyexe=$env/bin/python
+  printf '\n  Project dev dependencies in %s (add with: uv add --dev "name==version")\n\n' "$env"
+  row TOOL PROJECT PINNED
+  names=$(tools | awk '$3 == "dev" { print $1 }' | tr '\n' ' ')
+  if [ -x "$pyexe" ]; then
+    # One interpreter start for every lookup.
+    # shellcheck disable=SC2086
+    "$pyexe" - $names <<'EOF' >"${TMPDIR:-/tmp}/impeccable-doctor.$$" 2>/dev/null || true
+import sys
+from importlib import metadata
+for name in sys.argv[1:]:
+    try:
+        print(name, metadata.version(name))
+    except metadata.PackageNotFoundError:
+        print(name, "")
+EOF
+  fi
+  while read -r name ver kind _cmd; do
+    [ "$kind" = dev ] || continue
+    if [ ! -x "$pyexe" ]; then v=""
+    else v=$(awk -v n="$name" '$1 == n { print $2; exit }' "${TMPDIR:-/tmp}/impeccable-doctor.$$" 2>/dev/null || true); fi
+    if [ ! -x "$pyexe" ]; then tb="no environment: uv sync"
+    else tb=$(version_cell "$v" "$ver"); fi
+    if [ "$tb" = missing ]; then tb="not in the project"; fi
+    row "$name" "$tb" "$ver"
+  done < <(tools)
+  rm -f "${TMPDIR:-/tmp}/impeccable-doctor.$$"
+
+  printf '\n  docker: %s\n' "$state"
+  if [ -z "$built" ] && ! in_toolbox; then
+    printf '  The toolbox column applies once the image is built.\n'
+  fi
+  printf '  Run a tool the host lacks with: impeccable run <command>\n'
+}
+
+cmd_setup() {
+  local what=${1:-}
+  if [ $# -gt 0 ]; then shift; fi
+  case $what in
+    toolbox) setup_toolbox "$@" ;;
+    host) setup_host "$@" ;;
+    *) die "usage: impeccable setup toolbox [--rebuild] | impeccable setup host [--dry-run]" ;;
+  esac
+}
+
+setup_toolbox() {
+  local image
+  if in_toolbox; then die "already inside the toolbox"; fi
+  docker_ready || die "Docker is not running. Start it, or install the tools here with: impeccable setup host"
+  image=$(toolbox_image)
+  if [ "${1:-}" != --rebuild ] && image_built "$image"; then
+    say "toolbox image $image is up to date"
+    return 0
+  fi
+  say "building $image; the first build downloads a few GB and takes several minutes"
+  DOCKER_BUILDKIT=1 docker build -t "$image" -t "$IMAGE_REPO:latest" \
+    -f "$TOOLBOX_DIR/Dockerfile" "$SKILL_DIR" >&2
+  say "built $image"
+  local old
+  docker image ls "$IMAGE_REPO" --format '{{.Tag}}' | while read -r old; do
+    case $old in latest | "${image#*:}") ;; *)
+      say "removing superseded image $IMAGE_REPO:$old"
+      docker image rm "$IMAGE_REPO:$old" >/dev/null || true ;;
+    esac
+  done
+}
+
+setup_host() {
+  local dry="" name ver kind _cmd v os arch osv bin tmp
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run) dry=1 ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  have uv || die "uv is required: https://docs.astral.sh/uv/"
+  step() { if [ -n "$dry" ]; then printf '  %s\n' "$*"; else "$@"; fi; }
+
+  v=$(uv --version | first_version)
+  if ver_lt "$v" "$(pin UV_VERSION)"; then
+    say "uv $v is older than the pinned $(pin UV_VERSION); update it the way you installed it (for example: uv self update $(pin UV_VERSION))"
+  fi
+
+  # --no-bin keeps versioned python shims off PATH; uv run --python <version> finds them.
+  # shellcheck disable=SC2046
+  step uv python install --no-bin $(pin PYTHONS)
+
+  while read -r name ver kind _cmd; do
+    [ "$kind" = tool ] || continue
+    step uv tool install --exclude-newer "$(pin EXCLUDE_NEWER)" "$name==$ver"
+  done < <(tools)
+
+  # osv-scanner is a Go binary: download the release asset and check it against the release checksums.
+  osv=$(pin OSV_SCANNER_VERSION)
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case $(uname -m) in x86_64 | amd64) arch=amd64 ;; arm64 | aarch64) arch=arm64 ;; *) arch=$(uname -m) ;; esac
+  bin=${UV_TOOL_BIN_DIR:-$HOME/.local/bin}
+  if [ -n "$dry" ]; then
+    printf '  download osv-scanner_%s_%s v%s, verify osv-scanner_SHA256SUMS, install to %s\n' "$os" "$arch" "$osv" "$bin"
+  else
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/impeccable-osv.XXXXXX")
+    (
+      cd "$tmp"
+      base="https://github.com/google/osv-scanner/releases/download/v$osv"
+      curl -fsSLO "$base/osv-scanner_${os}_${arch}"
+      curl -fsSLO "$base/osv-scanner_SHA256SUMS"
+      grep " osv-scanner_${os}_${arch}\$" osv-scanner_SHA256SUMS | { shasum -a 256 -c - 2>/dev/null || sha256sum -c -; }
+      mkdir -p "$bin"
+      install -m 0755 "osv-scanner_${os}_${arch}" "$bin/osv-scanner"
+    )
+    rm -f "$tmp/osv-scanner_${os}_${arch}" "$tmp/osv-scanner_SHA256SUMS"
+    rmdir "$tmp"
+  fi
+
+  say "project-side tools come from the project's lock, not from here: uv add --dev \"name==version\" (see impeccable doctor)"
+  if ! linux_host; then say "valgrind, sanitize, and fuzz run in the toolbox on this host: impeccable setup toolbox"; fi
+}
+
+cmd_run() {
+  local image root cur rel key var
+  local -a args
+  if [ $# -eq 0 ]; then set -- bash; fi
+  if in_toolbox; then exec "$@"; fi
+  docker_ready || die "Docker is not running. Start it, or install the tools here with: impeccable setup host"
+  image=$(toolbox_image)
+  image_built "$image" || setup_toolbox
+
+  root=$(project_root)
+  cur=$(pwd -P)
+  case $cur in
+    "$root") rel="" ;;
+    "$root"/*) rel=${cur#"$root"/} ;;
+    *) root=$cur; rel="" ;;
+  esac
+  key=$(printf '%s' "$root" | hash12)
+
+  args=(run --rm --init
+    -v "$root:/work" -w "/work${rel:+/$rel}"
+    -v "impeccable-python-venvs-$key:/venvs"
+    -v impeccable-python-cache:/cache)
+  if [ -t 0 ]; then args+=(-i); fi
+  if [ -t 1 ]; then args+=(-t); fi
+  for var in $PASS_ENV; do
+    if [ -n "${!var:-}" ]; then args+=(-e "$var"); fi
+  done
+  exec docker "${args[@]}" "$image" "$@"
+}
+
+# The [project] name in pyproject.toml.
+project_name() {
+  awk '/^\[/ { in_project = ($0 == "[project]") }
+       in_project && /^name[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); gsub(/["'\'']/, ""); print; exit }' \
+    "$(project_root)/pyproject.toml" 2>/dev/null
+}
+
+cmd_sanitize() {
+  local kind=${1:-} part flags env pkg tmp
+  local -a reinstall=() preload=()
+  [ -n "$kind" ] || die "usage: impeccable sanitize <address|undefined|address,undefined> [pytest args]"
+  shift
+  for part in ${kind//,/ }; do
+    case " $SANITIZERS " in *" $part "*) ;; *) die "unknown sanitizer: $part" ;; esac
+  done
+  if ! linux_host || ! have gcc; then
+    if in_toolbox; then die "sanitize needs gcc on Linux"; fi
+    say "sanitize runs on Linux with gcc; running it in the toolbox"
+    cmd_run impeccable sanitize "$kind" "$@"
+  fi
+  have uv || die "uv is required"
+  [ -f "$(project_root)/pyproject.toml" ] || die "no pyproject.toml at $(project_root)"
+
+  # Instrument the extensions, not the interpreter: an unmodified CPython works with the
+  # ASan runtime preloaded. Build into a separate environment so .venv stays uninstrumented,
+  # and install non-editable so no instrumented build lands in the source tree.
+  flags="-fsanitize=$kind -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+  export CC=gcc CXX=g++ LDSHARED="gcc -shared" LDCXXSHARED="g++ -shared"
+  export CFLAGS="${CFLAGS:+$CFLAGS }$flags"
+  export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$flags"
+  export LDFLAGS="${LDFLAGS:+$LDFLAGS }-fsanitize=$kind"
+  env=$(project_env)
+  export UV_PROJECT_ENVIRONMENT="$env-sanitize-${kind//,/-}"
+
+  for pkg in ${IMPECCABLE_SANITIZE_PACKAGES:-$(project_name)}; do reinstall+=(--reinstall-package "$pkg"); done
+  [ ${#reinstall[@]} -gt 0 ] || die "cannot read the project name; set IMPECCABLE_SANITIZE_PACKAGES"
+  # setuptools reuses object files left in build/ by an earlier run with other flags, so
+  # build outside the tree and force the rebuild. Other backends build in a fresh directory.
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/impeccable-sanitize.XXXXXX")
+  printf '[build]\nbuild_base = %s/build\n\n[build_ext]\nforce = 1\n' "$tmp" >"$tmp/setup.cfg"
+  say "rebuilding ${reinstall[*]} with $flags into $UV_PROJECT_ENVIRONMENT"
+  DIST_EXTRA_CONFIG=$tmp/setup.cfg uv sync --locked --no-editable "${reinstall[@]}"
+  rm -r -- "$tmp"
+
+  # CPython leaks at exit by design, so leak detection stays off unless ASAN_OPTIONS says
+  # otherwise. pymalloc hides overflows inside its own blocks, so use libc malloc, which
+  # free-threaded builds do not offer.
+  case ",$kind," in *,address,*) preload=("LD_PRELOAD=$(gcc -print-file-name=libasan.so)") ;; esac
+  export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0}"
+  export UBSAN_OPTIONS="${UBSAN_OPTIONS:-print_stacktrace=1:halt_on_error=1}"
+  case ${UV_PYTHON:-} in
+    *t) say "free-threaded CPython has no PYTHONMALLOC=malloc; overflows inside Python allocator blocks can go unseen" ;;
+    *) export PYTHONMALLOC="${PYTHONMALLOC:-malloc}" ;;
+  esac
+  # pytest's default fd capture discards a sanitizer report when the process aborts, so
+  # capture at the sys level unless the caller chose. The pytest entry point, not
+  # `python -m pytest`, keeps the working directory off sys.path, ahead of the
+  # installed, instrumented package.
+  case " $* " in *" -s "* | *" --capture"*) ;; *) set -- --capture=sys "$@" ;; esac
+  say "${preload[*]+${preload[*]} }pytest $*"
+  exec uv run --no-sync env ${preload[@]+"${preload[@]}"} pytest "$@"
+}
+
+cmd_valgrind() {
+  local supp
+  if ! linux_host || ! have valgrind; then
+    if in_toolbox; then die "valgrind is missing"; fi
+    say "valgrind is not on this host; running it in the toolbox"
+    cmd_run impeccable valgrind "$@"
+  fi
+  have uv || die "uv is required"
+  case ${UV_PYTHON:-} in
+    *t) die "free-threaded CPython has no PYTHONMALLOC=malloc, and Valgrind cannot see inside its allocator; use a GIL build" ;;
+  esac
+  supp=$(toolbox_file valgrind-python.supp) || die "valgrind-python.supp not found next to $SELF"
+  # pymalloc hides small blocks from Valgrind, so use libc malloc. The uv-managed
+  # interpreters report uninitialised values in their own code; the suppressions drop those
+  # and keep invalid reads, writes, and frees. CPython leaks at exit, so leaks do not fail.
+  export PYTHONMALLOC=malloc
+  say "PYTHONMALLOC=malloc valgrind --error-exitcode=9 --suppressions=$supp python -m pytest $*"
+  exec uv run --locked valgrind --error-exitcode=9 --suppressions="$supp" python -m pytest "$@"
+}
+
+cmd_fuzz() {
+  local harness=${1:-} arg limit=1
+  local -a with
+  [ -n "$harness" ] || die "usage: impeccable fuzz <harness.py> [libFuzzer args]"
+  shift
+  [ -f "$harness" ] || die "no such harness: $harness"
+  if ! in_toolbox && ! atheris_wheel_exists; then
+    say "Atheris ships wheels only for Linux x86_64; running the harness in the toolbox"
+    cmd_run impeccable fuzz "$harness" "$@"
+  fi
+  have uv || die "uv is required"
+  # libFuzzer runs until it finds a crash; give every run a limit unless one is set.
+  for arg in "$@"; do
+    case $arg in -max_total_time=* | -runs=* | -atheris_runs=*) limit="" ;; esac
+  done
+  if [ -n "$limit" ]; then set -- "-max_total_time=${IMPECCABLE_FUZZ_SECONDS:-60}" "$@"; fi
+  with=(--with "atheris==$(pin ATHERIS_VERSION)")
+  if [ -n "${IMPECCABLE_WHEELS:-}" ]; then with=(--find-links "$IMPECCABLE_WHEELS" "${with[@]}"); fi
+  say "python $harness $*"
+  exec uv run --locked "${with[@]}" python "$harness" "$@"
+}
+
+main() {
+  local cmd=${1:-help}
+  if [ $# -gt 0 ]; then shift; fi
+  case $cmd in
+    doctor) cmd_doctor "$@" ;;
+    setup) cmd_setup "$@" ;;
+    run) cmd_run "$@" ;;
+    sanitize) cmd_sanitize "$@" ;;
+    valgrind) cmd_valgrind "$@" ;;
+    fuzz) cmd_fuzz "$@" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

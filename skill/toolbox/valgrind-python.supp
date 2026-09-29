@@ -1,0 +1,37 @@
+# Valgrind suppressions for the uv-managed (python-build-standalone) CPython builds.
+#
+# These clang-built interpreters report uninitialised-value errors in their own code on
+# `python -c pass`; the gcc-built CPython does not. Suppress those error kinds when the
+# top frame is in the interpreter or its bundled modules. Invalid reads, writes, and frees
+# stay reported, and so does anything whose top frame is in the extension under test.
+# Blind spot: an uninitialised value an extension hands back to the interpreter.
+{
+   uv-cpython-cond
+   Memcheck:Cond
+   obj:*/cpython-3.*-linux-*/*
+}
+{
+   uv-cpython-value1
+   Memcheck:Value1
+   obj:*/cpython-3.*-linux-*/*
+}
+{
+   uv-cpython-value2
+   Memcheck:Value2
+   obj:*/cpython-3.*-linux-*/*
+}
+{
+   uv-cpython-value4
+   Memcheck:Value4
+   obj:*/cpython-3.*-linux-*/*
+}
+{
+   uv-cpython-value8
+   Memcheck:Value8
+   obj:*/cpython-3.*-linux-*/*
+}
+{
+   uv-cpython-value16
+   Memcheck:Value16
+   obj:*/cpython-3.*-linux-*/*
+}

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Toolbox entrypoint. The project gets a Linux environment in the /venvs volume, never
+# the host's .venv. Keep one environment per UV_PYTHON value, so a free-threaded run
+# (UV_PYTHON=3.14t) does not rebuild the default environment, then run the command.
+set -euo pipefail
+
+if [ -z "${UV_PROJECT_ENVIRONMENT:-}" ]; then
+  export UV_PROJECT_ENVIRONMENT="/venvs/${UV_PYTHON:-default}"
+fi
+
+exec "$@"

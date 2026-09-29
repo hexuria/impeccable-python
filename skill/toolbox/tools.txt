@@ -1,0 +1,43 @@
+# Tools the checklist and CI shape rely on, pinned. Tools the skill names for some
+# projects only (cosmic-ray, simloop, pytest-codspeed, pyperf, deal, icontract) are not
+# listed; pin one in the project when you adopt it.
+#
+# kind "tool": a standalone CLI. The toolbox installs it with `uv tool install`, and
+#   `impeccable setup host` installs the same version on the host.
+# kind "dev": a library or CLI that must import the project (pytest plugins,
+#   Hypothesis, CrossHair, mutmut, type checkers). It belongs in the project's dev
+#   dependency group and uv.lock: `uv add --dev "name==version"`. `impeccable doctor`
+#   compares the project environment against these pins; nothing installs them.
+#
+# Pins track the latest release when written; a project with a cooldown
+# (`exclude-newer`) takes the newest version older than its window instead.
+#
+# Interpreters, uv, TLC, osv-scanner, and Atheris are pinned in the Dockerfile.
+#
+# name                  version   kind  command
+ruff                    0.16.9    tool
+zizmor                  1.30.1    tool
+pip-audit               2.10.1    tool
+griffe                  2.3.0     tool
+cyclonedx-bom           7.4.0     tool  cyclonedx-py
+pypi-attestations       0.0.30    tool
+pytest                  9.1.1     dev
+pytest-randomly         5.0.0     dev
+pytest-repeat           0.9.4     dev
+pytest-rerunfailures    16.7      dev
+pytest-timeout          2.4.0     dev
+coverage                7.16.2    dev
+diff-cover              10.6.0    dev
+hypothesis              6.168.3   dev
+hypothesis-crosshair    0.0.30    dev
+crosshair-tool          0.0.111   dev
+mutmut                  3.8.0     dev
+mypy                    2.3.1     dev
+pyright                 1.1.414   dev
+typeguard               4.6.0     dev
+pytest-run-parallel     0.10.0    dev
+frontrun                0.7.0     dev
+pytest-benchmark        5.3.0     dev
+pytest-memray           1.11.0    dev
+import-linter           2.15      dev
+deptry                  0.25.1    dev
