@@ -22,6 +22,7 @@ bounds, and what was left out.
   CrossHair, Atheris, OSS-Fuzz and CIFuzz, typeguard, frontrun,
   pytest-run-parallel, free-threaded CPython, ASan, UBSan, Valgrind,
   cibuildwheel, maturin-action, CodSpeed, pytest-benchmark, pytest-memray,
+  py-spy, memray, pyperf, and hyperfine,
   Griffe, uv, pip-audit, osv-scanner, PEP 740 attestations, Dependabot,
   zizmor, actionlint, TLA+, Nagini, and Lean.
 - **Risk-to-owner routing.** Each failure class gets one owner: the type
@@ -32,6 +33,13 @@ bounds, and what was left out.
   zizmor, and actionlint for supply chain and CI.
 - **Honest about gaps.** For thread interleavings and native memory, the skill
   names the check that owns each failure and says what stays uncovered.
+- **Optimization loop with a benchmark contract.** Asked to make Python faster,
+  the agent freezes a baseline, profiles before guessing, tries one measured
+  hypothesis at a time, keeps only changes that beat the baseline without
+  breaking the oracle, and stops when gains converge. `impeccable bench-guard`
+  fails the run if benchmark files, build configuration, interpreter, or
+  benchmark-affecting environment moved since the baseline. `perf-log.md`
+  records every attempt, including the ones reverted.
 - **Differential oracle for rewrites.** A rewrite, port, or optimization keeps
   the old implementation until the new one matches it on generated inputs.
 - **Anti-drift rules.** One harness per property, and no second model of the
@@ -83,6 +91,8 @@ UV_PYTHON=3.14t impeccable run uv run --locked pytest   # the same on free-threa
 impeccable sanitize address          # pytest with C extensions rebuilt under ASan
 impeccable valgrind                  # pytest under Valgrind memcheck
 impeccable fuzz tests/fuzz_parse.py  # an Atheris harness, 60 seconds by default
+impeccable bench-guard main -- uv run --locked pytest --benchmark-save=base
+impeccable bench-guard main -- uv run --locked pytest --benchmark-compare=base --benchmark-compare-fail=mean:5%
 impeccable setup host                # or install the same pinned tools on this machine
 ```
 
@@ -115,6 +125,7 @@ can also name it. Example prompts:
 Use impeccable-python to review the C extension in src/_speedups.c.
 Harden this asyncio worker pool with impeccable-python.
 I rewrote the tokenizer for speed. Verify it against the old one.
+Make this parser 2x faster with impeccable-python, keeping output identical.
 Audit how this project is verified and tell me what is missing.
 Set up CI for this published package following impeccable-python.
 ```

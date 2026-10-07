@@ -13,6 +13,9 @@
 #                                        interpreters' own false positives suppressed
 #   impeccable fuzz <harness.py> [libFuzzer args...]
 #                                        run an Atheris harness in the project environment
+#   impeccable bench-guard <baseline> [--allow <check>=<reason>]... [--benches <pathspec>]... [-- command...]
+#                                        check the benchmark contract against a baseline commit,
+#                                        then run the command under a machine-wide benchmark lock
 #
 # sanitize, valgrind, and fuzz run on a Linux host that can run them, and in the toolbox otherwise.
 #
@@ -20,6 +23,8 @@
 #   IMPECCABLE_MOUNT=<dir>              mount this directory instead of the detected project root
 #   IMPECCABLE_FUZZ_SECONDS=<n>         fuzz time limit when no -max_total_time or -runs is given (60)
 #   IMPECCABLE_SANITIZE_PACKAGES="a b"  packages sanitize rebuilds from source (default: the project)
+#   IMPECCABLE_BENCH_LOCK=<dir>         benchmark lock path (default ~/.cache/impeccable-bench/lock,
+#                                       shared between host and toolbox benchmark runs)
 #   UV_PYTHON=<version>                 interpreter for the project environment, for example 3.14t
 set -euo pipefail
 
@@ -397,6 +402,11 @@ cmd_run() {
   for var in $PASS_ENV; do
     if [ -n "${!var:-}" ]; then args+=(-e "$var"); fi
   done
+  # Bind-mount the benchmark lock directory so host and toolbox runs, and
+  # concurrent toolbox runs, share the same lock instead of competing.
+  bench=${IMPECCABLE_BENCH_LOCK:-$(bench_lock_dir)/lock}
+  mkdir -p "$(dirname "$bench")"
+  args+=(-v "$(dirname "$bench"):$(dirname "$bench")" -e "IMPECCABLE_BENCH_LOCK=$bench")
   exec docker "${args[@]}" "$image" "$@"
 }
 
@@ -543,6 +553,251 @@ cmd_fuzz() {
   exec uv run --locked "${with[@]}" python "$harness" "$@"
 }
 
+# A pyproject.toml minus its dependency tables: the build system, tool
+# configuration (pytest addopts can inject flags and disable plugins,
+# coverage can change what runs), and metadata baked into artifacts.
+# Dependency changes are reported by the deps note instead, so a legitimately
+# added package is a documented change rather than a failed contract check.
+non_dependency_tables() {
+  awk 'BEGIN { keep = 1 }
+    /^[[:space:]]*\[/ {
+      keep = !($0 ~ /^[[:space:]]*\[(project|dependency-groups)\]/ ||
+               $0 ~ /^[[:space:]]*\[project\.(dependencies|optional-dependencies)/ ||
+               $0 ~ /^[[:space:]]*\[tool\.uv\]/)
+    }
+    keep'
+}
+
+# The requires-python setting of a pyproject.toml read from stdin: it selects
+# the interpreter, so it belongs to the build check even though [project] is
+# otherwise a dependency table.
+requires_python() {
+  awk 'BEGIN { p = 0 }
+    /^[[:space:]]*\[/ { p = ($0 ~ /^[[:space:]]*\[project\]/) }
+    p && /^[[:space:]]*requires-python[[:space:]]*=/'
+}
+
+# The dependency tables of a pyproject.toml read from stdin: [project] (name,
+# version, requires-python aside, which requires_python covers for the build
+# check), [project.dependencies*], [dependency-groups], and [tool.uv].
+dependency_tables() {
+  awk 'BEGIN { keep = 0 }
+    /^[[:space:]]*\[/ {
+      keep = ($0 ~ /^[[:space:]]*\[(project|dependency-groups)\]/) ||
+             ($0 ~ /^[[:space:]]*\[project\.(dependencies|optional-dependencies)/) ||
+             ($0 ~ /^[[:space:]]*\[tool\.uv\]/)
+    }
+    keep'
+}
+
+# Environment variables that change interpreter or runtime behavior and do not ship to users.
+bench_runtime_env() {
+  env | sed -n -E 's/^(PYTHONOPTIMIZE|PYTHONDEVMODE|PYTHONMALLOC|PYTHON_JIT|PYTHON_GIL|PYTHONASYNCIODEBUG|PYTHONTRACEMALLOC|PYTHONWARNDEFAULTENCODING|PYTHONPROFILEIMPORTTIME|PYTHONPATH|COVERAGE_CORE|PYTEST_ADDOPTS|UV_PYTHON)=.*/\1/p'
+}
+
+# An interpreter fingerprint: implementation, version, free-threading, platform.
+interp_fingerprint() {
+  "$1" - <<'EOF' 2>/dev/null
+import platform, sys
+gil = getattr(sys, "_is_gil_enabled", None)
+print(sys.implementation.name, platform.python_version(),
+      "gil=" + ("on" if gil() else "off") if callable(gil) else "gil=n/a",
+      platform.machine(), platform.system().lower())
+EOF
+}
+
+# The benchmark lock lives outside /tmp so cmd_run can bind-mount the same
+# directory into the toolbox: host runs and toolbox runs then compete for one
+# lock instead of each sandbox holding its own.
+bench_lock_dir() {
+  echo "${XDG_CACHE_HOME:-$HOME/.cache}/impeccable-bench"
+}
+
+bench_lock_path() {
+  local p=${IMPECCABLE_BENCH_LOCK:-$(bench_lock_dir)/lock}
+  # Resolve a relative override: the path is also a Docker mount source, which must be absolute.
+  case $p in /*) ;; *) p=$(pwd -P)/$p ;; esac
+  echo "$p"
+}
+
+# Takes the lock directory $1, waiting for a live holder and clearing a dead
+# same-host one. A holder from another host (for example inside the toolbox,
+# which has its own hostname and pid namespace) cannot be reaped by pid, so
+# the wait is bounded and then the run dies rather than compete.
+acquire_bench_lock() {
+  local lock=$1 holder host pid waited=""
+  while ! mkdir "$lock" 2>/dev/null; do
+    holder=$(cat "$lock/pid" 2>/dev/null || true)
+    host=${holder%% *}; pid=${holder##* }
+    if [ "$host" = "$(hostname)" ] && [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      say "clearing a benchmark lock left by process $pid, which has exited"
+      rm -rf "$lock"
+      continue
+    fi
+    if [ -z "$waited" ]; then
+      say "another benchmark is running${holder:+ (process $holder)}; waiting so the runs do not compete"
+      waited=$(date +%s)
+    elif [ $(( $(date +%s) - waited )) -gt 600 ]; then
+      die "the benchmark lock at $lock has been held over 10 minutes (holder: ${holder:-unknown}); if the holder is dead, remove it: rm -rf $lock"
+    fi
+    sleep 2
+  done
+  echo "$(hostname) $$" >"$lock/pid"
+}
+
+cmd_bench_guard() {
+  local base="" top short files old new n fails=0 a lock
+  local -a cmd=() allows=() specs=()
+  local checks="benches build runtime command"
+  local usage_line="usage: impeccable bench-guard <baseline> [--allow <check>=<reason>]... [--benches <pathspec>]... [-- command...]"
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --allow) [ $# -ge 2 ] || die "$usage_line"; allows+=("$2"); shift ;;
+      --allow=*) allows+=("${1#--allow=}") ;;
+      --benches) [ $# -ge 2 ] || die "$usage_line"; specs+=("$2"); shift ;;
+      --benches=*) specs+=("${1#--benches=}") ;;
+      --) shift; cmd=("$@"); break ;;
+      -h | --help) say "$usage_line"; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) if [ -z "$base" ]; then base=$1; else die "$usage_line"; fi ;;
+    esac
+    shift
+  done
+  [ -n "$base" ] || die "$usage_line"
+  for a in ${allows[@]+"${allows[@]}"}; do
+    case " $checks " in *" ${a%%=*} "*) ;; *) die "--allow takes one of: $checks (got '${a%%=*}')" ;; esac
+    case $a in *=?*) ;; *) die "--allow ${a%%=*} needs a reason: --allow ${a%%=*}=<why>" ;; esac
+  done
+
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || die "bench-guard needs a git repository"
+  git -C "$top" rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "not a commit: $base"
+  short=$(git -C "$top" log -1 --format='%h %s' "$base")
+
+  row() { printf '  %-7s %-8s %s\n' "$1" "$2" "$3"; }
+  waiver() {
+    local x
+    for x in ${allows[@]+"${allows[@]}"}; do
+      if [ "${x%%=*}" = "$1" ]; then echo "${x#*=}"; return 0; fi
+    done
+    return 1
+  }
+  verdict() { # check pass|fail|note detail
+    local why
+    case $2 in
+      pass) row PASS "$1" "$3" ;;
+      note) row NOTE "$1" "$3" ;;
+      *) if why=$(waiver "$1"); then row WAIVED "$1" "$3; reason: $why"
+         else row FAIL "$1" "$3"; fails=$((fails + 1)); fi ;;
+    esac
+  }
+  changed() { # pathspec...
+    { git -C "$top" diff --name-only "$base" -- "$@"; git -C "$top" ls-files --others --exclude-standard -- "$@"; } | sort -u
+  }
+  listed() { # newline-separated items, at most six shown
+    n=$(printf '%s\n' "$1" | wc -l | tr -d ' ')
+    printf '%s\n' "$1" | head -6 | paste -sd ' ' -
+    if [ "$n" -gt 6 ]; then printf ' and %s more' "$((n - 6))"; fi
+  }
+
+  printf 'impeccable bench-guard against %s\n\n' "$short"
+
+  # benches: the benchmark definitions and their fixtures are the contract.
+  # --benches adds more files to it (an oracle module, a workload fixture).
+  # pytest-benchmark's saved results dir (.benchmarks/) is output, not contract.
+  specs=(':(glob)**/benches/**' ':(glob)**/benchmarks/**' ':(glob)**/conftest.py' \
+    ':(glob)**/bench_*.py' ':(glob)**/*_bench*.py' ':(glob)**/test_bench*.py' ':(glob)**/benchmark*.py' "${specs[@]+"${specs[@]}"}")
+  files=$(changed "${specs[@]}" | grep -v -E '(^|/)\.benchmarks/' || true)
+  if [ -z "$files" ]; then verdict benches pass "benchmark files match the baseline"
+  else verdict benches fail "benchmark files differ from the baseline: $(listed "$files")"; fi
+
+  # build: build configuration, tool settings, and interpreter selection are
+  # the contract. A pyproject.toml outside the dependency tables counts — its
+  # [tool.*] sections can inject pytest flags or change what runs — while
+  # dependency churn is reported by the deps note, not failed here.
+  files=$(changed ':(glob)**/setup.py' ':(glob)**/setup.cfg' ':(glob)**/MANIFEST.in' \
+    ':(glob)**/.python-version' ':(glob)**/meson.build' ':(glob)**/pybind11/**' ':(glob)**/Cargo.toml')
+  for f in $(changed ':(glob)**/pyproject.toml'); do
+    old_file=$(git -C "$top" show "$base:$f" 2>/dev/null || true)
+    old=$(printf '%s\n' "$old_file" | non_dependency_tables; printf '%s\n' "$old_file" | requires_python)
+    new=$(non_dependency_tables <"$top/$f"; requires_python <"$top/$f")
+    if [ "$old" != "$new" ]; then files=$(printf '%s\n%s' "$files" "$f [tool/build/requires-python]" | sed '/^$/d'); fi
+  done
+  if [ -z "$files" ]; then verdict build pass "build and tool configuration and interpreter selection match the baseline"
+  else verdict build fail "build or tool configuration differs from the baseline: $(listed "$files")"; fi
+
+  # runtime: environment that changes interpreter behavior does not ship.
+  files=$(bench_runtime_env)
+  if [ -z "$files" ]; then verdict runtime pass "no benchmark-affecting environment variables"
+  else verdict runtime fail "runtime environment that does not ship: $(listed "$files")"; fi
+
+  # command: the run must not change semantics or the machine. -O strips
+  # asserts and docstrings; an interpreter flag or a versioned interpreter
+  # binary selects a different machine than the baseline's files pinned.
+  if [ ${#cmd[@]} -gt 0 ]; then
+    local bad="" bad_interp="" seen_pytest=""
+    for a in "${cmd[@]}"; do
+      case $a in
+        -O | -OO | --optimize*) bad=$a ;;
+        --python | --python=* | --python-version | --python-version=*) bad_interp=$a ;;
+        -X | -X*) bad_interp=$a ;;
+        --benchmark-disable) seen_pytest=disabled ;;
+      esac
+      case ${a##*/} in
+        pytest | py.test) seen_pytest=yes ;;
+        python3.[0-9]* | pypy*) bad_interp=$a ;;
+      esac
+    done
+    if [ -n "$bad" ]; then verdict command fail "command passes $bad, which strips asserts and docstrings"
+    elif [ -n "$bad_interp" ]; then verdict command fail "command selects an interpreter ($bad_interp); interpreter selection is part of the contract"
+    elif [ "$seen_pytest" = disabled ]; then verdict command fail "command disables benchmarks (--benchmark-disable)"
+    elif [ "$seen_pytest" = yes ]; then verdict command pass "benchmark command runs pytest"
+    else verdict command note "not a pytest command; confirm it measures the optimized path" ; fi
+  fi
+
+  # Notes route risk to its owner; they never fail the run.
+  files=$(changed ':(glob)**/uv.lock' ':(glob)**/requirements*.txt' ':(glob)**/requirements*.in' ':(glob)**/poetry.lock' ':(glob)**/Pipfile.lock')
+  for f in $(changed ':(glob)**/pyproject.toml'); do
+    old=$(git -C "$top" show "$base:$f" 2>/dev/null | dependency_tables || true)
+    new=$(dependency_tables <"$top/$f")
+    if [ "$old" != "$new" ]; then files=$(printf '%s\n%s' "$files" "$f [deps]" | sed '/^$/d'); fi
+  done
+  files=$(printf '%s\n' "$files" | sed '/^$/d' | sort -u)
+  if [ -n "$files" ]; then
+    row NOTE deps "dependencies added or changed; declare them and run the dependency checks: $(listed "$files")"
+  fi
+
+  if [ -n "${PYTHONHASHSEED:-}" ]; then
+    row NOTE seed "PYTHONHASHSEED=$PYTHONHASHSEED pins hash order; confirm the baseline used the same value"
+  else
+    row NOTE seed "PYTHONHASHSEED is unset: hash randomization reorders sets and dicts run to run, so order-dependent workloads differ between identical commands — pin it on both sides when the workload is order-dependent"
+  fi
+
+  local py
+  for py in "$(project_env)/bin/python" python3 python; do
+    if [ -x "${py%% *}" ] || have "${py%% *}"; then
+      a=$(interp_fingerprint "$py")
+      [ -n "$a" ] && { row NOTE interp "measuring interpreter: $a (via $py)"; break; }
+    fi
+  done
+  row NOTE interp "the same implementation, exact version, and free-threaded mode must run both sides; the guard cannot prove the baseline's interpreter — record it in the run log"
+
+  if [ "$fails" -gt 0 ]; then
+    printf '\n'
+    die "$fails check(s) failed. Restore the contract, or waive a check on the record with --allow <check>=<reason>."
+  fi
+  [ ${#cmd[@]} -gt 0 ] || return 0
+
+  lock=$(bench_lock_path)
+  mkdir -p "$(dirname "$lock")"
+  acquire_bench_lock "$lock"
+  # shellcheck disable=SC2064 # expand now: $lock is local and gone when the EXIT trap fires
+  trap "rm -rf $(printf %q "$lock")" EXIT
+  trap 'exit 130' INT TERM
+  printf '\n'
+  say "running under the benchmark lock: ${cmd[*]}"
+  "${cmd[@]}"
+}
+
 main() {
   local cmd=${1:-help}
   if [ $# -gt 0 ]; then shift; fi
@@ -553,6 +808,7 @@ main() {
     sanitize) cmd_sanitize "$@" ;;
     valgrind) cmd_valgrind "$@" ;;
     fuzz) cmd_fuzz "$@" ;;
+    bench-guard) cmd_bench_guard "$@" ;;
     help | -h | --help) usage ;;
     *) usage >&2; exit 2 ;;
   esac
