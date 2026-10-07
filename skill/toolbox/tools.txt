@@ -1,6 +1,7 @@
 # Tools the checklist and CI shape rely on, pinned. Tools the skill names for some
-# projects only (for example pytest-codspeed, deal, time-machine, py-spy) are not listed; pin one in the project when
-# you adopt it.
+# projects only (for example pytest-codspeed, deal, time-machine) and the performance
+# toolbox performance.md names (py-spy, memray, pyperf, hyperfine, scalene) are not
+# listed; pin one in the project when you adopt it.
 #
 # kind "tool": a standalone CLI. The toolbox installs it with `uv tool install`, and
 #   `impeccable setup host` installs the same version on the host.

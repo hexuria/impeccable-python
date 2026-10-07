@@ -4,7 +4,9 @@ description: >-
   Use when writing, reviewing, hardening, or designing Python for high-stakes or
   long-lived packages and services, including their C, C++, or Rust
   extensions, threads, asyncio, or free-threaded CPython; when rewriting or
-  optimizing Python that already works; or when auditing or setting up how a
+  optimizing Python that already works — making it faster, reducing its
+  memory, or beating another implementation — or when auditing or setting
+  up how a
   Python project is verified (Hypothesis, mutmut, CrossHair, Atheris, strict
   typing, TLA+, Nagini, Lean). Checklist for exhaustive
   testing, trustworthy benchmarks, misuse-resistant APIs a type checker
@@ -31,6 +33,7 @@ description: >-
 - Libraries and CLIs that import the project (pytest and its plugins, Hypothesis, CrossHair, mutmut, the type checker) belong in the project's dev dependency group, pinned by `uv.lock`: `uv add --dev "hypothesis==<pin>"`. Run them with `uv run --locked`. In CI use `uv sync --locked` (or `UV_LOCKED=1`): `--frozen` installs a stale lock without complaint, and a bare `uv run` rewrites `uv.lock`.
 - Run anything the host lacks, or that needs Linux, in the toolbox: `scripts/impeccable run uv run --locked pytest`. The project gets its own Linux environment in a Docker volume, never the host `.venv`. `UV_PYTHON=3.14t scripts/impeccable run ...` uses free-threaded CPython in a separate environment.
 - Run tests against C or C++ extensions rebuilt under a sanitizer with `scripts/impeccable sanitize <address|undefined|address,undefined> [pytest args]`, under Valgrind with `scripts/impeccable valgrind [pytest args]`, and an Atheris harness with `scripts/impeccable fuzz <harness.py> [libFuzzer args]` (60 seconds unless `-max_total_time` or `-runs` is given). Each moves to the toolbox when the host cannot run it, which on macOS is always.
+- Run every benchmark behind a speed claim through `scripts/impeccable bench-guard <baseline> -- <command>`. It fails when benchmark files, build configuration, interpreter selection, or benchmark-affecting environment variables differ from the baseline commit, or when the command strips semantics (`-O`). It notes changed dependencies, an unpinned `PYTHONHASHSEED`, and the measuring interpreter, and it holds a machine-wide lock so benchmarks run one at a time. `--allow <check>=<reason>` waives one check on the record; the reason goes in the report.
 - Install tools on the host with `scripts/impeccable setup host` only when the user asks for it.
 
 ## Checklist (run what applies)
@@ -139,11 +142,17 @@ Cover the full performance profile:
 - Under, at, and over capacity
 - All relevant interpreters and platforms, including 3.14t if you ship for it
 
-Trustworthy measurements (CI should fail on regression):
+Trustworthy measurements (CI should fail on regression — verified against the tools, not their homepages):
 
-- Gate with pytest-benchmark, and turn the gate on explicitly: it fails only with `--benchmark-compare=<id> --benchmark-compare-fail=mean:5%`. Compare old and new in the same job on the same host, and leave headroom (under 100% load).
-- Prefer instruction or simulated-cycle metrics over wall time alone. When shared CI runners are too noisy for the wall-time threshold, use CodSpeed's simulation mode (`pytest --codspeed`, Valgrind-based, cycles estimated from instructions and cache misses); its gate and history live in CodSpeed's hosted service, and a local run is a smoke test.
-- Gate memory too: pytest-memray `@pytest.mark.limit_memory("1 MB")` and `limit_leaks` (Linux and macOS; it measures the allocation high-water mark, not RSS).
+- Gate with pytest-benchmark, and turn the gate on explicitly: `--benchmark-compare` alone prints both runs and exits 0 even on a large regression. Only `--benchmark-compare=<id> --benchmark-compare-fail=mean:5%` fails the run, and the failure surfaces as a `PerformanceRegression` raised at terminal summary after the tests pass — CI sees exit 1, but a human reading only the test table sees green.
+- pytest-benchmark leaves the garbage collector enabled during timing (`--benchmark-disable-gc` is opt-in) and defaults `warmup` to off on CPython (`auto` resolves to PyPy-only); the calibration phase warms the code path but not your caches, so a candidate that wins only on warmed state is suspect. stdlib `timeit` is the opposite: it disables the GC during timing, so an allocation-heavy change can look good under `timeit` and regress under pytest-benchmark or in production. Never mix the two in one claim.
+- Saved baselines are machine- and interpreter-scoped: `--benchmark-save` writes `.benchmarks/<platform>-<impl>-<version>-<arch>/`, and `--benchmark-compare` also takes a literal file path for a cross-interpreter comparison.
+- CodSpeed locally (`pytest --codspeed`) runs walltime mode only, writes `.codspeed/results_*.json`, and neither compares nor gates; `--codspeed-mode=simulation` outside CodSpeed's runner environment executes the function once with no measurement at all — the Valgrind-based cycle counting and the regression gate live in the hosted service (CODSPEED_ENV), and a local run is only a smoke test. Passing `--codspeed` blocks pytest-benchmark in the same session.
+- `pyperf` produces the most rigorous wall-clock statistics (worker processes, calibration, instability warnings) but never gates: `pyperf compare_to` exits 0 on a 1.5x regression, and `--min-speed` only changes the significance label.
+- `hyperfine` compares whole commands and includes interpreter startup (~10–15 ms), so it is right for startup and script-level comparisons and wrong for in-process microbenchmarks.
+- `perf` needs `perf_event_paranoid` below 1 plus a PMU; it is blocked on many shared VMs. `py-spy` is the portable profiler: launch mode works under `ptrace_scope=1`, while attaching to a running process needs scope 0 or `CAP_SYS_PTRACE`.
+- Gate memory too: pytest-memray `@pytest.mark.limit_memory("1 MB")` measures peak live bytes, not lifetime churn — a test that allocates and frees megabytes passes a 1 MB limit, while holding 1.5 MB live fails. `limit_leaks` covers retained allocations (Linux and macOS; neither measures RSS).
+- `tracemalloc` diffs attribute allocation by line inside a test when the question is where memory went, not how much.
 
 Measure what matters, not only speed:
 
@@ -154,6 +163,23 @@ Measure what matters, not only speed:
 - Prefer the real deployment target, not only a beefy CI box
 
 Record how you load the system (open, closed, partly-open), which statistic you report (mean, median, histogram, CDF), and how you decide a regression. "y is greater than x" is not enough. Profile before optimizing (py-spy for CPU, memray for allocations); when a profile shows per-object overhead, prefer `slots=True` dataclasses and contiguous arrays over many small objects.
+
+#### Benchmark contract
+
+A speed claim compares equal work under equal conditions. The benchmark definitions, workloads, interpreter, and environment at the baseline commit form the contract, and both sides of every comparison run under it:
+
+- Same work: the same inputs, rounds, and output, timed through the production code path. A warmed cache, a reused fixture, or a mock that only the candidate gets is cheating, not speed.
+- Same interpreter: implementation (CPython, PyPy), exact version, and free-threaded or not. `sys._is_gil_enabled()` is part of the machine: an extension without declared free-threading support silently re-enables the GIL on 3.14t with only a `RuntimeWarning`, and `PYTHON_GIL` flips it at startup. A claim measured on 3.13 says nothing about 3.14t.
+- Same environment: `PYTHONOPTIMIZE` strips asserts and docstrings, `PYTHONDEVMODE` adds checks, `PYTHONMALLOC` changes the allocator, `PYTHONHASHSEED` reorders sets and dicts (hash randomization is on by default, so identical commands can run observably different work), `PYTHONPATH` can resolve a different copy of the code, and `PYTHON_JIT`/`PYTHON_GIL`/`COVERAGE_CORE` change what runs. Set means changed; the contract is the default environment plus anything both sides share on the record.
+- Same dependencies: a package added or bumped is part of the candidate; declare it and run section 10.
+- Clean rounds: state built in one round reaches the next only when production reuses it the same way, and both sides get it.
+- One benchmark at a time on the machine.
+- Repeated runs with their spread reported. A single wall-clock run is an anecdote; on a shared box the spread can exceed the gain.
+- A surprisingly large win is a suspected bug until the oracle and a fresh run confirm it.
+
+To change the contract (a missing workload, a broken benchmark), say so, make the change in its own commit, and measure the baseline again on it. `scripts/impeccable bench-guard` enforces the mechanical half of the contract — benchmark files, build configuration, interpreter selection, and benchmark-affecting environment — and records the rest as notes; the oracle and the workload matrix carry the rest.
+
+For an optimization run (making working Python faster, hitting a speedup target, or beating another implementation), follow [performance.md](performance.md).
 
 ### 7. Documentation
 
@@ -415,5 +441,8 @@ Record only checks that ran. A clean type check is not a check of behavior.
 - Boolean soup, type aliases for distinct units, and public `list` or `dict` attributes callers can mutate
 - Blanket `# type: ignore`, `Any` leaking from untyped dependencies, and pydantic's lax mode at a trust boundary
 - Leaking a dependency's types (pydantic, httpx, SQLAlchemy) into a stable public API without intent
+- Speed claims off benchmark files, interpreter, dependencies, or environment that drifted from the baseline, or off a single timing run with no spread
+- `await asyncio.gather(...)` over unbounded input with no concurrency limit, backpressure, or cancellation plan
+- Optimizing a path the profile never showed hot, or cargo-cult rewrites (`__slots__` everywhere, generators everywhere) applied without measuring
 - Silent TODO debt, and forever-pinned dependency versions with no reminder
 - Claiming this quality bar without the checks that apply (a strict type checker, property tests, sanitizers on native code), misuse-resistant types, or decision docs
