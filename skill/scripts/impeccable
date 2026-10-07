@@ -614,7 +614,10 @@ bench_lock_dir() {
 }
 
 bench_lock_path() {
-  echo "${IMPECCABLE_BENCH_LOCK:-$(bench_lock_dir)/lock}"
+  local p=${IMPECCABLE_BENCH_LOCK:-$(bench_lock_dir)/lock}
+  # Resolve a relative override: the path is also a Docker mount source, which must be absolute.
+  case $p in /*) ;; *) p=$(pwd -P)/$p ;; esac
+  echo "$p"
 }
 
 # Takes the lock directory $1, waiting for a live holder and clearing a dead
