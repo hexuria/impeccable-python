@@ -1,54 +1,13 @@
 # impeccable-python
 
-An agent skill for writing, reviewing, and verifying high-stakes Python. It
-works with Claude Code, Codex, Cursor, and any agent that loads `SKILL.md`
-skills.
+An agent skill for writing, reviewing, verifying, and optimizing high-stakes
+Python. It works with Claude Code, Codex, Cursor, and any agent that loads
+`SKILL.md` skills.
 
 The skill makes an agent treat "the tests pass" as the start of the job. The
 agent checks the change against the failures that can actually happen, picks
 the right verifier for each one, and reports what was checked, under which
 bounds, and what was left out.
-
-## What it does
-
-- **Checklist for every change.** Strict typing, error-path tests, property
-  and fuzz tests, known-answer test vectors, mutation testing, sanitizers on
-  C and C++ extensions, thread and asyncio checks, trustworthy benchmarks,
-  misuse-resistant APIs, API compatibility, public-API typing tests, tests
-  on the built wheel and sdist, downstream tests, and locked, audited
-  dependencies with a cooldown.
-- **Tools it knows.** Ruff, ast-grep, mypy, Pyright, Pyrefly, ty, stubtest,
-  pytest with strict settings, coverage.py, diff-cover, mutmut, Hypothesis,
-  CrossHair, Atheris, OSS-Fuzz and CIFuzz, typeguard, frontrun,
-  pytest-run-parallel, free-threaded CPython, ASan, UBSan, Valgrind,
-  cibuildwheel, maturin-action, CodSpeed, pytest-benchmark, pytest-memray,
-  py-spy, memray, pyperf, and hyperfine,
-  Griffe, uv, pip-audit, osv-scanner, PEP 740 attestations, Dependabot,
-  zizmor, actionlint, TLA+, Nagini, and Lean.
-- **Risk-to-owner routing.** Each failure class gets one owner: the type
-  checker for type misuse, Atheris for untrusted input, sanitizers for C
-  extensions, frontrun for small thread protocols, TLA+ for multi-actor
-  designs, CrossHair for bounded symbolic checks, Nagini or Lean for proof
-  kernels, typing tests per user checker for public types, and pip-audit,
-  zizmor, and actionlint for supply chain and CI.
-- **Honest about gaps.** For thread interleavings and native memory, the skill
-  names the check that owns each failure and says what stays uncovered.
-- **Optimization loop with a benchmark contract.** Asked to make Python faster,
-  the agent freezes a baseline, profiles before guessing, tries one measured
-  hypothesis at a time, keeps only changes that beat the baseline without
-  breaking the oracle, and stops when gains converge. `impeccable bench-guard`
-  fails the run if benchmark files, build configuration, interpreter, or
-  benchmark-affecting environment moved since the baseline. `perf-log.md`
-  records every attempt, including the ones reverted.
-- **Differential oracle for rewrites.** A rewrite, port, or optimization keeps
-  the old implementation until the new one matches it on generated inputs.
-- **Anti-drift rules.** One harness per property, and no second model of the
-  same state machine without a conformance link to the production Python.
-- **Honest reports.** Each claim uses a precise term such as property-tested,
-  type-checked, or symbolically checked, with its bounds, assumptions, and
-  blind spots. A CrossHair run or a bounded check is never called a proof.
-- **Audit mode.** Asked to review verification, the agent reads the repo
-  first, maps what already runs, and recommends only what fills a real gap.
 
 ## Install
 
@@ -74,6 +33,34 @@ folder wherever they load skills from, for example `.claude/skills/` or
 
 Rust extensions (PyO3, maturin): the skill hands their Rust side to the
 impeccable-rust skill; install it too if you ship one.
+
+## Use it
+
+The agent loads the skill on its own when you work on serious Python. You
+can also name it. Example prompts:
+
+```text
+Use impeccable-python to review the C extension in src/_speedups.c.
+Harden this asyncio worker pool with impeccable-python.
+I rewrote the tokenizer for speed. Verify it against the old one.
+Make this parser 2x faster with impeccable-python, keeping output identical.
+Audit how this project is verified and tell me what is missing.
+Set up CI for this published package following impeccable-python.
+```
+
+Every change ends with a report like this:
+
+```text
+Evidence:     differentially tested tokenize() vs old_tokenize(): 500 examples
+              (ci profile) plus the crosshair backend (200 examples, no
+              deadline), no divergence
+              type-checked with mypy 2.3.1 --strict; mutation-tested: mutmut,
+              0 survivors in tokenize.py
+Documented:   ADR for the token table; no __hash__ on Token on purpose
+Deferred:     Atheris campaign on tokenize() moved to nightly CI
+Compat/deps:  griffe check clean against v2.4.0; pip-audit clean
+Verification: pure Python deterministic behavior; owner of each affected failure mode
+```
 
 ## Toolbox
 
@@ -116,33 +103,38 @@ Lean) are not included.
 On macOS the toolbox runs what the host cannot: Valgrind, Atheris (its wheels
 are Linux x86_64 only), and the sanitizer builds.
 
-## Use it
+## What it covers
 
-The agent loads the skill on its own when you work on serious Python. You
-can also name it. Example prompts:
+Verification by failure class — strict typing, error-path tests, property and
+fuzz tests, known-answer vectors, mutation testing, sanitizers on C and C++
+extensions, thread and asyncio checks, trustworthy benchmarks,
+misuse-resistant APIs, API compatibility, public-API typing tests, tests on
+the built wheel and sdist, downstream tests, and locked, audited
+dependencies. Each failure class gets one verifier that owns it.
 
-```text
-Use impeccable-python to review the C extension in src/_speedups.c.
-Harden this asyncio worker pool with impeccable-python.
-I rewrote the tokenizer for speed. Verify it against the old one.
-Make this parser 2x faster with impeccable-python, keeping output identical.
-Audit how this project is verified and tell me what is missing.
-Set up CI for this published package following impeccable-python.
-```
+Optimization as a search — asked to make Python faster, the agent freezes a
+baseline, profiles before guessing, tries one measured hypothesis at a time,
+keeps only changes that beat the baseline without breaking the oracle, and
+stops when gains converge. `impeccable bench-guard` fails the run when
+benchmark files, build or tool configuration, interpreter, or
+benchmark-affecting environment moved since the baseline; `perf-log.md`
+records every attempt, including the ones reverted. See
+[`skill/performance.md`](skill/performance.md).
 
-Every change ends with a report like this:
+Rewrites get a differential oracle — the old implementation stays until the
+new one matches it on generated inputs.
 
-```text
-Evidence:     differentially tested tokenize() vs old_tokenize(): 500 examples
-              (ci profile) plus the crosshair backend (200 examples, no
-              deadline), no divergence
-              type-checked with mypy 2.3.1 --strict; mutation-tested: mutmut,
-              0 survivors in tokenize.py
-Documented:   ADR for the token table; no __hash__ on Token on purpose
-Deferred:     Atheris campaign on tokenize() moved to nightly CI
-Compat/deps:  griffe check clean against v2.4.0; pip-audit clean
-Verification: pure Python deterministic behavior; owner of each affected failure mode
-```
+Reports are honest — each claim uses a precise term such as property-tested,
+type-checked, or symbolically checked, with its bounds, assumptions, and
+blind spots. A bounded check is never called a proof.
+
+Tools it knows: Ruff, ast-grep, mypy, Pyright, Pyrefly, ty, stubtest, pytest,
+coverage.py, diff-cover, mutmut, Hypothesis, CrossHair, Atheris, OSS-Fuzz and
+CIFuzz, typeguard, frontrun, pytest-run-parallel, free-threaded CPython,
+ASan, UBSan, Valgrind, cibuildwheel, maturin-action, CodSpeed,
+pytest-benchmark, pytest-memray, py-spy, memray, pyperf, hyperfine, Griffe,
+uv, pip-audit, osv-scanner, PEP 740 attestations, Dependabot, zizmor,
+actionlint, TLA+, Nagini, and Lean.
 
 ## License
 
